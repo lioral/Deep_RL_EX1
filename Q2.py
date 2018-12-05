@@ -14,8 +14,7 @@ import torch.optim as optim
 import torch.nn.functional as F
 import torchvision.transforms as T
 
-
-env = gym.make('Acrobot-v1').unwrapped
+from utils import *
 
 # set up matplotlib
 is_ipython = 'inline' in matplotlib.get_backend()
@@ -27,28 +26,13 @@ plt.ion()
 # if gpu is to be used
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-
-######################################################################
-# Replay Memory
-# -------------
-#
-# We'll be using experience replay memory for training our DQN. It stores
-# the transitions that the agent observes, allowing us to reuse this data
-# later. By sampling from it randomly, the transitions that build up a
-# batch are decorrelated. It has been shown that this greatly stabilizes
-# and improves the DQN training procedure.
-#
-# For this, we're going to need two classses:
-#
-# -  ``Transition`` - a named tuple representing a single transition in
-#    our environment
-# -  ``ReplayMemory`` - a cyclic buffer of bounded size that holds the
-#    transitions observed recently. It also implements a ``.sample()``
-#    method for selecting a random batch of transitions for training.
-#
-
 Transition = namedtuple('Transition',
                         ('state', 'action', 'next_state', 'reward'))
+
+
+resize = T.Compose([T.ToPILImage(),
+                    T.Resize(40, interpolation=Image.CUBIC),
+                    T.ToTensor()])
 
 
 class ReplayMemory(object):
@@ -72,79 +56,6 @@ class ReplayMemory(object):
         return len(self.memory)
 
 
-######################################################################
-# Now, let's define our model. But first, let quickly recap what a DQN is.
-#
-# DQN algorithm
-# -------------
-#
-# Our environment is deterministic, so all equations presented here are
-# also formulated deterministically for the sake of simplicity. In the
-# reinforcement learning literature, they would also contain expectations
-# over stochastic transitions in the environment.
-#
-# Our aim will be to train a policy that tries to maximize the discounted,
-# cumulative reward
-# :math:`R_{t_0} = \sum_{t=t_0}^{\infty} \gamma^{t - t_0} r_t`, where
-# :math:`R_{t_0}` is also known as the *return*. The discount,
-# :math:`\gamma`, should be a constant between :math:`0` and :math:`1`
-# that ensures the sum converges. It makes rewards from the uncertain far
-# future less important for our agent than the ones in the near future
-# that it can be fairly confident about.
-#
-# The main idea behind Q-learning is that if we had a function
-# :math:`Q^*: State \times Action \rightarrow \mathbb{R}`, that could tell
-# us what our return would be, if we were to take an action in a given
-# state, then we could easily construct a policy that maximizes our
-# rewards:
-#
-# .. math:: \pi^*(s) = \arg\!\max_a \ Q^*(s, a)
-#
-# However, we don't know everything about the world, so we don't have
-# access to :math:`Q^*`. But, since neural networks are universal function
-# approximators, we can simply create one and train it to resemble
-# :math:`Q^*`.
-#
-# For our training update rule, we'll use a fact that every :math:`Q`
-# function for some policy obeys the Bellman equation:
-#
-# .. math:: Q^{\pi}(s, a) = r + \gamma Q^{\pi}(s', \pi(s'))
-#
-# The difference between the two sides of the equality is known as the
-# temporal difference error, :math:`\delta`:
-#
-# .. math:: \delta = Q(s, a) - (r + \gamma \max_a Q(s', a))
-#
-# To minimise this error, we will use the `Huber
-# loss <https://en.wikipedia.org/wiki/Huber_loss>`__. The Huber loss acts
-# like the mean squared error when the error is small, but like the mean
-# absolute error when the error is large - this makes it more robust to
-# outliers when the estimates of :math:`Q` are very noisy. We calculate
-# this over a batch of transitions, :math:`B`, sampled from the replay
-# memory:
-#
-# .. math::
-#
-#    \mathcal{L} = \frac{1}{|B|}\sum_{(s, a, s', r) \ \in \ B} \mathcal{L}(\delta)
-#
-# .. math::
-#
-#    \text{where} \quad \mathcal{L}(\delta) = \begin{cases}
-#      \frac{1}{2}{\delta^2}  & \text{for } |\delta| \le 1, \\
-#      |\delta| - \frac{1}{2} & \text{otherwise.}
-#    \end{cases}
-#
-# Q-network
-# ^^^^^^^^^
-#
-# Our model will be a convolutional neural network that takes in the
-# difference between the current and previous screen patches. It has two
-# outputs, representing :math:`Q(s, \mathrm{left})` and
-# :math:`Q(s, \mathrm{right})` (where :math:`s` is the input to the
-# network). In effect, the network is trying to predict the *quality* of
-# taking each action given the current input.
-#
-
 class DQN(nn.Module):
 
     def __init__(self):
@@ -157,43 +68,41 @@ class DQN(nn.Module):
         self.bn3 = nn.BatchNorm2d(32)
         self.head = nn.Linear(128, 2)
 
+
     def forward(self, x):
         x = F.relu(self.bn1(self.conv1(x)))
         x = F.relu(self.bn2(self.conv2(x)))
         x = F.relu(self.bn3(self.conv3(x)))
         return self.head(x.view(x.size(0), -1))
 
+    def Save(self, optimizer, episode, episode_durations, plt_duration, dir_path):
+        torch.save({'episode': episode,
+                    'model_state_dict': self.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'episode_durations': episode_durations
+                   }, dir_path + '/' + str(episode) + '.pt')
+        plt_duration.savefig(dir_path + '/Duration.png')
+        print('Save Model episode', episode)
 
-resize = T.Compose([T.ToPILImage(),
-                    T.Resize(40, interpolation=Image.CUBIC),
-                    T.ToTensor()])
+    def Load(self, model_path):
+        optimizer = optim.RMSprop(self.parameters())
 
-# This is based on the code from gym.
-screen_width = 600
+        checkpoint = torch.load(model_path)
+        self.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        episode_durations = checkpoint['episode_durations']
 
-#
-# def get_joints_location():
-#     world_width = env.x_threshold * 2
-#     scale = screen_width / world_width
-#     return int(env.state[0] * scale + screen_width / 2.0)  # MIDDLE OF CART
-#
+        self.eval()
+        return optimizer, episode_durations
 
-def get_screen():
+
+def get_screen(env):
     screen = env.render(mode='rgb_array').transpose(
         (2, 0, 1))  # transpose into torch order (CHW)
     # Strip off the top and bottom of the screen
     # screen = screen[:, 160:320]
     # view_width = 320
-    # cart_location = get_joints_location()
-    # if cart_location < view_width // 2:
-    #     slice_range = slice(view_width)
-    # elif cart_location > (screen_width - view_width // 2):
-    #     slice_range = slice(-view_width, None)
-    # else:
-    #     slice_range = slice(cart_location - view_width // 2,
-    #                         cart_location + view_width // 2)
-    # Strip off the edges, so that we have a square image centered on a cart
-    # screen = screen[:, :, slice_range]
+
     # Convert to float, rescare, convert to torch tensor
     # (this doesn't require a copy)
     screen = np.ascontiguousarray(screen, dtype=np.float32) / 255
@@ -202,61 +111,12 @@ def get_screen():
     return resize(screen).unsqueeze(0).to(device)
 
 
-env.reset()
-plt.figure()
-plt.imshow(get_screen().cpu().squeeze(0).permute(1, 2, 0).numpy(),
-           interpolation='none')
-plt.title('Example extracted screen')
-plt.show()
-
-
-######################################################################
-# Training
-# --------
-#
-# Hyperparameters and utilities
-# ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-# This cell instantiates our model and its optimizer, and defines some
-# utilities:
-#
-# -  ``select_action`` - will select an action accordingly to an epsilon
-#    greedy policy. Simply put, we'll sometimes use our model for choosing
-#    the action, and sometimes we'll just sample one uniformly. The
-#    probability of choosing a random action will start at ``EPS_START``
-#    and will decay exponentially towards ``EPS_END``. ``EPS_DECAY``
-#    controls the rate of the decay.
-# -  ``plot_durations`` - a helper for plotting the durations of episodes,
-#    along with an average over the last 100 episodes (the measure used in
-#    the official evaluations). The plot will be underneath the cell
-#    containing the main training loop, and will update after every
-#    episode.
-#
-
-BATCH_SIZE = 128
-GAMMA = 0.999
-EPS_START = 0.9
-EPS_END = 0.05
-EPS_DECAY = 200
-TARGET_UPDATE = 10
-
-policy_net = DQN().to(device)
-target_net = DQN().to(device)
-target_net.load_state_dict(policy_net.state_dict())
-target_net.eval()
-
-optimizer = optim.RMSprop(policy_net.parameters())
-memory = ReplayMemory(10000)
-
-
-steps_done = 0
-
-
-def select_action(state):
-    global steps_done
+def select_action(state, Cons, policy_net, steps_done, epsilon_history):
     sample = random.random()
-    eps_threshold = EPS_END + (EPS_START - EPS_END) * \
-        math.exp(-1. * steps_done / EPS_DECAY)
+    eps_threshold = Cons.EPS_END + (Cons.EPS_START - Cons.EPS_END) * \
+        math.exp(-1. * steps_done / Cons.EPS_DECAY)
     steps_done += 1
+    epsilon_history.append(eps_threshold)
     if sample > eps_threshold:
         with torch.no_grad():
             return policy_net(state).max(1)[1].view(1, 1)
@@ -264,10 +124,7 @@ def select_action(state):
         return torch.tensor([[random.randrange(2)]], device=device, dtype=torch.long)
 
 
-episode_durations = []
-
-
-def plot_durations():
+def plot_durations(episode_durations):
     plt.figure(2)
     plt.clf()
     durations_t = torch.tensor(episode_durations, dtype=torch.float)
@@ -286,11 +143,34 @@ def plot_durations():
         display.clear_output(wait=True)
         display.display(plt.gcf())
 
+def Plot_Epsilon_Loss(epsilon_history,loss_history):
+    plt.figure(3)
+    plt.clf()
+    epsilon_t = torch.tensor(epsilon_history, dtype=torch.float)
+    plt.title('Training...')
+    plt.xlabel('Episode')
+    plt.ylabel('Epsilon')
+    plt.semilogy(epsilon_t.numpy())
 
-def optimize_model():
-    if len(memory) < BATCH_SIZE:
+    plt.figure(4)
+    plt.clf()
+    loss_history_t = torch.tensor(loss_history, dtype=torch.float)
+    plt.title('Training...')
+    plt.xlabel('Episode')
+    plt.ylabel('Loss')
+    plt.semilogy(loss_history_t.numpy())
+
+    plt.pause(0.001)  # pause a bit so that plots are updated
+    if is_ipython:
+        display.clear_output(wait=True)
+        display.display(plt.gcf())
+
+
+
+def optimize_model(memory, Cons, policy_net, target_net, optimizer, loss_history):
+    if len(memory) < Cons.BATCH_SIZE:
         return
-    transitions = memory.sample(BATCH_SIZE)
+    transitions = memory.sample(Cons.BATCH_SIZE)
     # Transpose the batch (see http://stackoverflow.com/a/19343/3343043 for
     # detailed explanation).
     batch = Transition(*zip(*transitions))
@@ -309,13 +189,15 @@ def optimize_model():
     state_action_values = policy_net(state_batch).gather(1, action_batch)
 
     # Compute V(s_{t+1}) for all next states.
-    next_state_values = torch.zeros(BATCH_SIZE, device=device)
+    next_state_values = torch.zeros(Cons.BATCH_SIZE, device=device)
     next_state_values[non_final_mask] = target_net(non_final_next_states).max(1)[0].detach()
     # Compute the expected Q values
-    expected_state_action_values = (next_state_values * GAMMA) + reward_batch
+    expected_state_action_values = (next_state_values * Cons.GAMMA) + reward_batch
 
     # Compute Huber loss
     loss = F.smooth_l1_loss(state_action_values, expected_state_action_values.unsqueeze(1))
+
+    loss_history.append(loss)
 
     # Optimize the model
     optimizer.zero_grad()
@@ -324,58 +206,99 @@ def optimize_model():
         param.grad.data.clamp_(-1, 1)
     optimizer.step()
 
+class Constants:
 
-######################################################################
-#
-# Below, you can find the main training loop. At the beginning we reset
-# the environment and initialize the ``state`` Tensor. Then, we sample
-# an action, execute it, observe the next screen and the reward (always
-# 1), and optimize our model once. When the episode ends (our model
-# fails), we restart the loop.
-#
-# Below, `num_episodes` is set small. You should download
-# the notebook and run lot more epsiodes.
-#
+    BATCH_SIZE = 128
+    GAMMA = 0.999
+    EPS_START = 0.9
+    EPS_END = 0.05
+    EPS_DECAY = 200
+    TARGET_UPDATE = 10
 
-num_episodes = 50
-for i_episode in range(num_episodes):
-    # Initialize the environment and state
-    env.reset()
-    last_screen = get_screen()
-    current_screen = get_screen()
-    state = current_screen - last_screen
-    for t in count():
-        # Select and perform an action
-        action = select_action(state)
-        _, reward, done, _ = env.step(action.item())
-        reward = torch.tensor([reward], device=device)
+def Main():
+    load_models = False
+    model_dir = "/Acrobot_Model"
+    Model_to_Load = '/Dec_04_22_52_36/99.pt'
+    Cons = Constants()
+    output_dir_path = prepare_model_dir(model_dir)
+    env = gym.make('Acrobot-v1').unwrapped
 
-        # Observe new state
-        last_screen = current_screen
-        current_screen = get_screen()
-        if not done:
-            next_state = current_screen - last_screen
-        else:
-            next_state = None
+    # env.reset()
+    # plt.figure()
+    # plt.imshow(get_screen().cpu().squeeze(0).permute(1, 2, 0).numpy(),
+    #            interpolation='none')
+    # plt.title('Example extracted screen')
+    # plt.show()
 
-        # Store the transition in memory
-        memory.push(state, action, next_state, reward)
+    episode_durations = []
 
-        # Move to the next state
-        state = next_state
+    policy_net = DQN().to(device)
+    target_net = DQN().to(device)
 
-        # Perform one step of the optimization (on the target network)
-        optimize_model()
-        if done:
-            episode_durations.append(t + 1)
-            plot_durations()
-            break
-    # Update the target network
-    if i_episode % TARGET_UPDATE == 0:
-        target_net.load_state_dict(policy_net.state_dict())
+    if load_models:
+        optimizer, episode_durations = policy_net.Load(model_dir)
+    else:
+        optimizer = optim.RMSprop(policy_net.parameters())
 
-print('Complete')
-env.render()
-env.close()
-plt.ioff()
-plt.show()
+    target_net.load_state_dict(policy_net.state_dict())
+    target_net.eval()
+
+    memory = ReplayMemory(10000)
+
+    steps_done = 0
+    minimum_duration = float('inf')
+    num_episodes = 100
+
+
+    for i_episode in range(num_episodes):
+        epsilon_history = []
+        loss_history = []
+        # Initialize the environment and state
+        env.reset()
+        last_screen = get_screen(env)
+        current_screen = get_screen(env)
+        state = current_screen - last_screen
+        for t in count():
+            # Select and perform an action
+            action = select_action(state, Cons, policy_net, steps_done, epsilon_history)
+            steps_done += 1
+            _, reward, done, _ = env.step(action.item())
+            reward = torch.tensor([reward], device=device)
+
+            # Observe new state
+            last_screen = current_screen
+            current_screen = get_screen(env)
+            if not done:
+                next_state = current_screen - last_screen
+            else:
+                next_state = None
+
+            # Store the transition in memory
+            memory.push(state, action, next_state, reward)
+
+            # Move to the next state
+            state = next_state
+
+            # Perform one step of the optimization (on the target network)
+            optimize_model(memory, Cons, policy_net, target_net, optimizer, loss_history)
+            if done:
+                episode_durations.append(t + 1)
+                plot_durations(episode_durations)
+                policy_net.Save(optimizer, i_episode, episode_durations, plt.figure(2), output_dir_path)
+                break
+            if t % 100 == 0:
+                Plot_Epsilon_Loss(epsilon_history,loss_history)
+        # Update the target network
+        if i_episode % Cons.TARGET_UPDATE == 0:
+            target_net.load_state_dict(policy_net.state_dict())
+
+    env.render()
+    env.close()
+
+
+if __name__ == '__main__':
+    Main()
+    plt.ioff()
+    plt.show()
+    print('Complete')
+
