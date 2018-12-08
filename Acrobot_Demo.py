@@ -106,7 +106,7 @@ class Constants:
 
 def Main():
     model_dir = "/Acrobot_Model"
-    Model_to_Load = '/Dec_04_22_52_36/99.pt'
+    Model_to_Load = '/Dec_05_17_15_02/692.pt'
     Cons = Constants()
     env = gym.make('Acrobot-v1').unwrapped
 

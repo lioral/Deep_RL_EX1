@@ -4,7 +4,6 @@ import random
 import numpy as np
 import matplotlib
 import matplotlib.pyplot as plt
-from collections import namedtuple
 from itertools import count
 from PIL import Image
 
@@ -26,68 +25,71 @@ plt.ion()
 # if gpu is to be used
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-Transition = namedtuple('Transition',
-                        ('state', 'action', 'next_state', 'reward'))
-
-
 resize = T.Compose([T.ToPILImage(),
                     T.Resize(40, interpolation=Image.CUBIC),
                     T.ToTensor()])
 
 
-class ReplayMemory(object):
-
-    def __init__(self, capacity):
-        self.capacity = capacity
-        self.memory = []
-        self.position = 0
-
-    def push(self, *args):
-        """Saves a transition."""
-        if len(self.memory) < self.capacity:
-            self.memory.append(None)
-        else:
-            # skip positive reward
-            while int(self.memory[self.position].reward) == 1:
-                self.position = (self.position + 1) % self.capacity
-
-        self.memory[self.position] = Transition(*args)
-        self.position = (self.position + 1) % self.capacity
-
-    def sample(self, batch_size):
-        return random.sample(self.memory, batch_size)
-
-    def __len__(self):
-        return len(self.memory)
+# class ReplayMemory(object):
+#
+#     def __init__(self, capacity):
+#         self.capacity = capacity
+#         self.memory = []
+#         self.position = 0
+#
+#     def push(self, *args):
+#         """Saves a transition."""
+#         if len(self.memory) < self.capacity:
+#             self.memory.append(None)
+#         else:
+#             # skip positive reward
+#             while int(self.memory[self.position].reward) == 1:
+#                 self.position = (self.position + 1) % self.capacity
+#
+#         self.memory[self.position] = Transition(*args)
+#         self.position = (self.position + 1) % self.capacity
+#
+#     def sample(self, batch_size):
+#         return random.sample(self.memory, batch_size)
+#
+#     def __len__(self):
+#         return len(self.memory)
 
 
 class DQN(nn.Module):
 
-    def __init__(self):
+    def __init__(self, num_actions):
         super(DQN, self).__init__()
-        self.conv1 = nn.Conv2d(3, 16, kernel_size=5, stride=2)
-        self.bn1 = nn.BatchNorm2d(16)
-        self.conv2 = nn.Conv2d(16, 32, kernel_size=5, stride=2)
+        self.conv1 = nn.Conv2d(3, 32, kernel_size=3, stride=1)
+        self.maxpool1 = nn.MaxPool2d(2)
+        self.bn1 = nn.BatchNorm2d(32)
+
+        self.conv2 = nn.Conv2d(32, 32, kernel_size=3, stride=1)
+        self.maxpool2 = nn.MaxPool2d(2)
         self.bn2 = nn.BatchNorm2d(32)
-        self.conv3 = nn.Conv2d(32, 32, kernel_size=5, stride=2)
-        self.bn3 = nn.BatchNorm2d(32)
-        self.head = nn.Linear(128, 2)
+
+        self.conv3 = nn.Conv2d(32, 64, kernel_size=3, stride=1)
+        self.maxpool3 = nn.MaxPool2d(2)
+        self.bn3 = nn.BatchNorm2d(64)
+
+        self.head = nn.Linear(576, num_actions)
 
 
     def forward(self, x):
-        x = F.relu(self.bn1(self.conv1(x)))
-        x = F.relu(self.bn2(self.conv2(x)))
-        x = F.relu(self.bn3(self.conv3(x)))
+        x = F.relu(self.bn1(self.maxpool1(self.conv1(x))))
+        x = F.relu(self.bn2(self.maxpool2(self.conv2(x))))
+        x = F.relu(self.bn3(self.maxpool3(self.conv3(x))))
         return self.head(x.view(x.size(0), -1))
 
-    def Save(self, optimizer, episode, episode_durations, plt_duration, plt_reward, accumulate_reward, dir_path):
+    def Save(self, optimizer, episode, plt_reward,
+             accumulate_reward, avg_accumulate_reward, STD_accumulate_reward, dir_path):
         torch.save({'episode': episode,
                     'model_state_dict': self.state_dict(),
                     'optimizer_state_dict': optimizer.state_dict(),
-                    'episode_durations': episode_durations,
-                    'accumulate_reward': accumulate_reward
+                    'avg_accumulate_reward': avg_accumulate_reward,
+                    'STD_accumulate_reward': STD_accumulate_reward,
+                    'accumulate_reward': accumulate_reward,
                    }, dir_path + '/' + str(episode) + '.pt')
-        plt_duration.savefig(dir_path + '/Duration.png')
         plt_reward.savefig(dir_path + '/Reward.png')
         print('Save Model episode', episode)
 
@@ -97,13 +99,12 @@ class DQN(nn.Module):
         checkpoint = torch.load(model_path)
         self.load_state_dict(checkpoint['model_state_dict'])
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        episode_durations = checkpoint['episode_durations']
         last_episode = checkpoint["episode"] + 1
         accumulate_reward = checkpoint["accumulate_reward"]
 
         self.eval()
 
-        return optimizer, episode_durations, last_episode, accumulate_reward
+        return optimizer, last_episode, accumulate_reward
 
 
 def get_screen(env):
@@ -121,75 +122,38 @@ def get_screen(env):
     return resize(screen).unsqueeze(0).to(device)
 
 
-def epsilon_decay_schedule(episode, Cons):
-    EPISODE_DECAY = 500
-    return Cons.EPS_DECAY_MIN + (Cons.EPS_DECAY_MAX - Cons.EPS_DECAY_MIN) * \
-                    math.exp(-1. * episode / EPISODE_DECAY)
+def select_action(state, Cons, policy_net, steps_done, num_actions):
+    # Check if learning stage began
+    eps_threshold = 1.0 # init epsilon
+    if steps_done <= Cons.PURE_EXPLORATION_STEPS:
+        return torch.tensor([[random.randrange(num_actions)]], device=device, dtype=torch.long), eps_threshold
 
-
-
-def select_action(state, Cons, policy_net, steps_done, episode, epsilon_history):
+    # Epsilon greedy
     sample = random.random()
-    epsilon_decay = epsilon_decay_schedule(episode, Cons)
-    eps_threshold = Cons.EPS_END + (Cons.EPS_START - Cons.EPS_END) * \
-        math.exp(-1. * steps_done / epsilon_decay)
-    steps_done += 1
-    epsilon_history.append(eps_threshold)
+    decay_factor = min(1.0, steps_done / Cons.STOP_EXPLORATION_STEPS)
+    eps_threshold = Cons.EPS_START + decay_factor * (Cons.EPS_END - Cons.EPS_START)
+
     if sample > eps_threshold:
         with torch.no_grad():
-            return policy_net(state).max(1)[1].view(1, 1)
+            return policy_net(state).max(1)[1].view(1, 1), eps_threshold
     else:
-        return torch.tensor([[random.randrange(2)]], device=device, dtype=torch.long)
+        return torch.tensor([[random.randrange(num_actions)]], device=device, dtype=torch.long), eps_threshold
 
 
-def plot_durations(episode_durations, episode_reward):
-    plt.figure(2)
-    plt.clf()
-    durations_t = torch.tensor(episode_durations, dtype=torch.float)
-    plt.title('Training...')
-    plt.xlabel('Episode')
-    plt.ylabel('Duration')
-    plt.plot(durations_t.numpy())
-    # Take 100 episode averages and plot them too
-    if len(durations_t) >= 100:
-        means = durations_t.unfold(0, 100, 1).mean(1).view(-1)
-        means = torch.cat((torch.zeros(99), means))
-        plt.plot(means.numpy())
-
-    plt.figure(3)
-    plt.clf()
-    reward_t = torch.tensor(episode_reward, dtype=torch.float)
-    plt.title('Training Reward')
+def plot_durations(accumulate_reward, avg_accumulate_reward, STD_accumulate_reward):
+    fig = plt.figure(2)
+    fig.clf()
+    durations_t = np.arange(len(accumulate_reward))
+    plt.title('Training - Accumulated reward and AVG reward')
     plt.xlabel('Episode')
     plt.ylabel('Reward')
-    plt.plot(reward_t.numpy())
-    # Take 100 episode averages and plot them too
-    if len(reward_t) >= 100:
-        means = reward_t.unfold(0, 100, 1).mean(1).view(-1)
-        means = torch.cat((torch.zeros(99), means))
-        plt.plot(means.numpy())
+    plt.plot(durations_t, accumulate_reward, color='r')
+    plt.plot(durations_t, avg_accumulate_reward, color='b')
+    plt.fill_between(durations_t, np.array(avg_accumulate_reward) - np.array(STD_accumulate_reward),
+                     np.array(avg_accumulate_reward) + np.array(STD_accumulate_reward), color='b', alpha=0.2)
+    plt.tight_layout()
+    plt.legend(['Reward', 'Mean reward', 'STD'])
 
-    plt.pause(0.001)  # pause a bit so that plots are updated
-    if is_ipython:
-        display.clear_output(wait=True)
-        display.display(plt.gcf())
-
-def Plot_Epsilon_Loss(epsilon_history,loss_history):
-    plt.figure(4)
-    plt.clf()
-    epsilon_t = torch.tensor(epsilon_history, dtype=torch.float)
-    plt.title('Epsilon in episode...')
-    plt.xlabel('Episode')
-    plt.ylabel('Epsilon')
-    plt.semilogy(epsilon_t.numpy())
-
-    plt.figure(5)
-    plt.clf()
-    loss_history_t = torch.tensor(loss_history, dtype=torch.float)
-    plt.title('Loss in episode...')
-    plt.xlabel('Episode')
-    plt.ylabel('Loss')
-    plt.semilogy(loss_history_t.numpy())
 
     plt.pause(0.001)  # pause a bit so that plots are updated
     if is_ipython:
@@ -198,141 +162,188 @@ def Plot_Epsilon_Loss(epsilon_history,loss_history):
 
 
 
-def optimize_model(memory, Cons, policy_net, target_net, optimizer, loss_history):
-    if len(memory) < Cons.BATCH_SIZE:
-        return
-    transitions = memory.sample(Cons.BATCH_SIZE)
-    # Transpose the batch (see http://stackoverflow.com/a/19343/3343043 for
-    # detailed explanation).
-    batch = Transition(*zip(*transitions))
+
+def optimize_model(memory, Cons, policy_net, target_net, optimizer, steps_done):
+    if not memory.min_batch_load(Cons.BATCH_SIZE) or steps_done <= Cons.PURE_EXPLORATION_STEPS:
+        return 0
+    states_batch, actions_batch, rewards_batch, next_states_batch, not_done_mask, idx_batch, IS_weight = memory.sample(Cons.BATCH_SIZE)
 
     # Compute a mask of non-final states and concatenate the batch elements
-    non_final_mask = torch.tensor(tuple(map(lambda s: s is not None,
-                                          batch.next_state)), device=device, dtype=torch.uint8)
-    non_final_next_states = torch.cat([s for s in batch.next_state
-                                                if s is not None])
-    state_batch = torch.cat(batch.state)
-    action_batch = torch.cat(batch.action)
-    reward_batch = torch.cat(batch.reward)
+    # non_final_mask = torch.tensor(tuple(map(lambda s: s is not None,
+    #                                       batch.next_state)), device=device, dtype=torch.uint8)
+    # non_final_next_states = torch.cat([s for s in batch.next_state
+    #                                             if s is not None])
+    states_batch = torch.cat(states_batch)
+    actions_batch = torch.cat(actions_batch)
+    rewards_batch = torch.cat(rewards_batch)
+    next_states_batch = torch.cat(next_states_batch)
+    not_done_mask = (1 - torch.tensor(not_done_mask, device=device).type(torch.cuda.FloatTensor))
+    IS_weight = torch.tensor(IS_weight).unsqueeze(1).type(torch.cuda.FloatTensor)
 
     # Compute Q(s_t, a) - the model computes Q(s_t), then we select the
     # columns of actions taken
-    state_action_values = policy_net(state_batch).gather(1, action_batch)
+    state_action_values = policy_net(states_batch).gather(1, actions_batch)
 
     # Compute V(s_{t+1}) for all next states.
-    next_state_values = torch.zeros(Cons.BATCH_SIZE, device=device)
-    next_state_values[non_final_mask] = target_net(non_final_next_states).max(1)[0].detach()
+    next_state_values = target_net(next_states_batch).max(1)[0].detach() * not_done_mask
     # Compute the expected Q values
-    expected_state_action_values = (next_state_values * Cons.GAMMA) + reward_batch
+    expected_state_action_values = (next_state_values * Cons.GAMMA) + rewards_batch
 
     # Compute Huber loss
-    loss = F.smooth_l1_loss(state_action_values, expected_state_action_values.unsqueeze(1))
-
-    loss_history.append(loss)
+    loss = (state_action_values - expected_state_action_values.unsqueeze(1)).pow(2) * IS_weight
+    prios = loss + Cons.PRIOR_REG #update prios
+    loss = loss.mean()
 
     # Optimize the model
     optimizer.zero_grad()
     loss.backward()
-    for param in policy_net.parameters():
-        param.grad.data.clamp_(-1, 1)
+    # for param in policy_net.parameters():
+    #     param.grad.data.clamp_(-1, 1)
+    for i in range(Cons.BATCH_SIZE):
+        idx = idx_batch[i]
+        memory.update(idx, prios[i].data.cpu().numpy())
+    # update parameters
     optimizer.step()
+
+    return 1
 
 class Constants:
 
-    BATCH_SIZE = 256
+    BATCH_SIZE = 24
     GAMMA = 0.999
-    EPS_START = 0.9
+    EPS_START = 1
     EPS_END = 0.05
     EPS_DECAY_MAX = 2000
     EPS_DECAY_MIN = 20
-    TARGET_UPDATE = 10
+    TARGET_UPDATE = 500
     MAX_DURATION = 2000
+    REPLAY_BUFFER = 100000
+    LEARNING_RATE = 0.00025
+    PURE_EXPLORATION_STEPS = 50000
+    STOP_EXPLORATION_STEPS = 250000
+    PRIOR_REG = 1e-5
+    EPISODES_MEAN_REWARD = 10
+    STOP_CONDITION = -100
 
 def Main():
-    load_models = True
+    load_models = False
+    save_model = True
     model_dir = "/Acrobot_Model"
     Model_to_Load = '/Dec_05_17_15_02'
     Model_num = '/150.pt'
     Cons = Constants()
-    env = gym.make('Acrobot-v1').unwrapped
+    env = gym.make('Acrobot-v1')
+    num_actions = env.action_space.n
 
-    # env.reset()
-    # plt.figure()
-    # plt.imshow(get_screen().cpu().squeeze(0).permute(1, 2, 0).numpy(),
-    #            interpolation='none')
-    # plt.title('Example extracted screen')
-    # plt.show()
-
-    episode_durations = []
-    accumulate_reward = []
-    last_episode = 0
-
-    policy_net = DQN().to(device)
-    target_net = DQN().to(device)
+    policy_net = DQN(num_actions).to(device)
+    target_net = DQN(num_actions).to(device)
 
     if load_models:
         output_dir_path = os.getcwd() + model_dir + Model_to_Load
-        optimizer, episode_durations, last_episode, accumulate_reward = policy_net.Load(output_dir_path + Model_num)
+        optimizer, last_episode, accumulate_reward = policy_net.Load(output_dir_path + Model_num)
     else:
         output_dir_path = prepare_model_dir(model_dir)
-        optimizer = optim.RMSprop(policy_net.parameters())
+        optimizer = optim.RMSprop(policy_net.parameters(), lr=Cons.LEARNING_RATE)
 
     target_net.load_state_dict(policy_net.state_dict())
     target_net.eval()
 
-    memory = ReplayMemory(10000)
+    memory = PrioritizedReplayMemory(Cons.REPLAY_BUFFER)
 
-    minimum_duration = float('inf')
-    num_episodes = 3000
+    best_avg_score = -np.inf
+    i_episode = 0
+    parameters_update_counter = 0
 
+    accumulate_reward = []
+    avg_accumulate_reward = []
+    STD_accumulate_reward = [0]
 
-    for i_episode in range(last_episode, num_episodes):
-        epsilon_history = []
-        loss_history = []
-        episode_reward = 0
-        steps_done = 0
-        # Initialize the environment and state
-        env.reset()
-        last_screen = get_screen(env)
-        current_screen = get_screen(env)
-        state = current_screen - last_screen
-        for t in count():
-            # Select and perform an action
-            action = select_action(state, Cons, policy_net, steps_done, i_episode, epsilon_history)
-            steps_done += 1
-            _, reward, done, _ = env.step(action.item())
-            reward = torch.tensor([reward], device=device)
-            episode_reward += float(reward)
+    episode_reward = 0
 
-            # Observe new state
-            last_screen = current_screen
-            current_screen = get_screen(env)
-            if not done:
-                next_state = current_screen - last_screen
-            else:
-                next_state = None
+    # Initialize the environment and state
+    env.reset()
+    # last_screen = get_screen(env)
+    current_screen = get_screen(env)
+    state = current_screen
 
-            # Store the transition in memory
-            memory.push(state, action, next_state, reward)
-
-            # Move to the next state
-            state = next_state
-
-            # Perform one step of the optimization (on the target network)
-            optimize_model(memory, Cons, policy_net, target_net, optimizer, loss_history)
-
-            if done or t == Cons.MAX_DURATION:
-                episode_durations.append(t + 1)
-                accumulate_reward.append(episode_reward)
-                plot_durations(episode_durations, accumulate_reward)
-                policy_net.Save(optimizer, i_episode, episode_durations,
-                                plt.figure(2), plt.figure(3), accumulate_reward, output_dir_path)
+    for t in count():
+        # stop criterion average reward above under 200
+        if len(avg_accumulate_reward):
+            if avg_accumulate_reward[-1] > Cons.STOP_CONDITION:
+                policy_net.Save(optimizer, i_episode, plt.figure(2),
+                                accumulate_reward, avg_accumulate_reward, STD_accumulate_reward,
+                                output_dir_path)
                 break
-            if t % 500 == 0:
-                Plot_Epsilon_Loss(epsilon_history,loss_history)
+        # Select and perform an action
+        action, eps_threshold = select_action(state, Cons, policy_net, t, num_actions)
+
+        _, reward, done, _ = env.step(action.item())
+        reward = torch.tensor([reward], device=device)
+        episode_reward += float(reward)
+
+        # Observe new state
+        last_screen = current_screen
+        current_screen = get_screen(env)
+        next_state = current_screen - last_screen
+
+        # Store the transition in memory with priority for the new sample
+        current_Q_value = policy_net(state)[0][action]
+        next_Q_value = target_net(next_state).detach().max(1)[0]
+        target_value = reward + Cons.GAMMA * next_Q_value
+        # Loss function of bellman eq to priority assessment
+        loss_eq = np.abs(target_value.data - current_Q_value.squeeze().data)
+
+        transition = Transition(state=state, action=action, next_state=next_state,
+                                reward=reward, done=float(done))
+
+        memory.push(transition, loss_eq)
+
+        # Move to the next state
+        state = next_state
+
+        # Perform one step of the optimization (on the target network)
+        parameters_update_counter +=\
+            optimize_model(memory, Cons, policy_net, target_net, optimizer, t)
+
         # Update the target network
-        if i_episode % Cons.TARGET_UPDATE == 0:
+        if parameters_update_counter % Cons.TARGET_UPDATE == 0 and not parameters_update_counter == 0:
             target_net.load_state_dict(policy_net.state_dict())
+
+
+        if done:
+            # restart the environment to new episode
+            _ = env.reset()
+            current_screen = get_screen(env)
+            state = current_screen
+
+            # statistics:
+            accumulate_reward.append(episode_reward)
+            i_episode += 1
+            episode_reward = 0
+
+            # Average reward and variance (standard deviation)
+            if len(accumulate_reward) <= Cons.EPISODES_MEAN_REWARD:
+                avg_accumulate_reward.append(np.mean(np.array(accumulate_reward)))
+                if len(accumulate_reward) >= 2:
+                    STD_accumulate_reward.append(np.std(np.array(accumulate_reward)))
+            else:
+                avg_accumulate_reward.append(np.mean(np.array(accumulate_reward[-10:])))
+                STD_accumulate_reward.append(np.std(np.array(accumulate_reward[-10:])))
+
+            # Check if average acc. reward has improved
+            if avg_accumulate_reward[-1] > best_avg_score:
+                best_avg_score = avg_accumulate_reward[-1]
+                if save_model:
+                    policy_net.Save(optimizer, i_episode, plt.figure(2),
+                                    accumulate_reward, avg_accumulate_reward, STD_accumulate_reward,
+                                    output_dir_path)
+            # Update plot of acc. rewards every 20 episodes and print
+            # training details
+            if i_episode % 20 == 0:
+                plot_durations(accumulate_reward, avg_accumulate_reward, STD_accumulate_reward)
+                print('Episode {}\tAvg. Reward: {:.2f}\tEpsilon: {:.4f}\t'.format(
+                    i_episode, avg_accumulate_reward[-1], eps_threshold))
+                print('Best avg. episodic reward:', best_avg_score)
 
     env.render()
     env.close()
