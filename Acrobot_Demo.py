@@ -123,7 +123,7 @@ def VideoClip(frame_stack):
 
 
 def Main():
-    Model_to_Load = '/Model_Wieghts.pt'
+    Model_to_Load = '/Acrobot_Wieghts.pt'
     env = gym.make('Acrobot-v1')
     GenVideoClip = False
 
