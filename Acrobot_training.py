@@ -30,32 +30,6 @@ resize = T.Compose([T.ToPILImage(),
                     T.ToTensor()])
 
 
-# class ReplayMemory(object):
-#
-#     def __init__(self, capacity):
-#         self.capacity = capacity
-#         self.memory = []
-#         self.position = 0
-#
-#     def push(self, *args):
-#         """Saves a transition."""
-#         if len(self.memory) < self.capacity:
-#             self.memory.append(None)
-#         else:
-#             # skip positive reward
-#             while int(self.memory[self.position].reward) == 1:
-#                 self.position = (self.position + 1) % self.capacity
-#
-#         self.memory[self.position] = Transition(*args)
-#         self.position = (self.position + 1) % self.capacity
-#
-#     def sample(self, batch_size):
-#         return random.sample(self.memory, batch_size)
-#
-#     def __len__(self):
-#         return len(self.memory)
-
-
 class DQN(nn.Module):
 
     def __init__(self, num_actions):
@@ -110,9 +84,6 @@ class DQN(nn.Module):
 def get_screen(env):
     screen = env.render(mode='rgb_array').transpose(
         (2, 0, 1))  # transpose into torch order (CHW)
-    # Strip off the top and bottom of the screen
-    # screen = screen[:, 160:320]
-    # view_width = 320
 
     # Convert to float, rescare, convert to torch tensor
     # (this doesn't require a copy)
@@ -173,10 +144,10 @@ def optimize_model(memory, Cons, policy_net, target_net, optimizer, steps_done):
     #                                       batch.next_state)), device=device, dtype=torch.uint8)
     # non_final_next_states = torch.cat([s for s in batch.next_state
     #                                             if s is not None])
-    states_batch = torch.cat(states_batch)
-    actions_batch = torch.cat(actions_batch)
-    rewards_batch = torch.cat(rewards_batch)
-    next_states_batch = torch.cat(next_states_batch)
+    states_batch = torch.cat(states_batch).cuda()
+    actions_batch = torch.cat(actions_batch).cuda()
+    rewards_batch = torch.cat(rewards_batch).cuda()
+    next_states_batch = torch.cat(next_states_batch).cuda()
     not_done_mask = (1 - torch.tensor(not_done_mask, device=device).type(torch.cuda.FloatTensor))
     IS_weight = torch.tensor(IS_weight).unsqueeze(1).type(torch.cuda.FloatTensor)
 
@@ -209,7 +180,7 @@ def optimize_model(memory, Cons, policy_net, target_net, optimizer, steps_done):
 
 class Constants:
 
-    BATCH_SIZE = 24
+    BATCH_SIZE = 32
     GAMMA = 0.999
     EPS_START = 1
     EPS_END = 0.05
@@ -219,6 +190,8 @@ class Constants:
     MAX_DURATION = 2000
     REPLAY_BUFFER = 100000
     LEARNING_RATE = 0.00025
+    EPS_RMSPROP = 0.01
+    ALPHA_RMSPROP = 0.95
     PURE_EXPLORATION_STEPS = 50000
     STOP_EXPLORATION_STEPS = 250000
     PRIOR_REG = 1e-5
@@ -226,11 +199,8 @@ class Constants:
     STOP_CONDITION = -100
 
 def Main():
-    load_models = False
     save_model = True
     model_dir = "/Acrobot_Model"
-    Model_to_Load = '/Dec_05_17_15_02'
-    Model_num = '/150.pt'
     Cons = Constants()
     env = gym.make('Acrobot-v1')
     num_actions = env.action_space.n
@@ -238,12 +208,10 @@ def Main():
     policy_net = DQN(num_actions).to(device)
     target_net = DQN(num_actions).to(device)
 
-    if load_models:
-        output_dir_path = os.getcwd() + model_dir + Model_to_Load
-        optimizer, last_episode, accumulate_reward = policy_net.Load(output_dir_path + Model_num)
-    else:
-        output_dir_path = prepare_model_dir(model_dir)
-        optimizer = optim.RMSprop(policy_net.parameters(), lr=Cons.LEARNING_RATE)
+
+    output_dir_path = prepare_model_dir(model_dir)
+    optimizer = optim.RMSprop(policy_net.parameters(), lr=Cons.LEARNING_RATE,
+                              eps=Cons.EPS_RMSPROP, alpha=Cons.ALPHA_RMSPROP)
 
     target_net.load_state_dict(policy_net.state_dict())
     target_net.eval()
@@ -270,7 +238,7 @@ def Main():
         # stop criterion average reward above under 200
         if len(avg_accumulate_reward):
             if avg_accumulate_reward[-1] > Cons.STOP_CONDITION:
-                policy_net.Save(optimizer, i_episode, plt.figure(2),
+                policy_net.Save(optimizer, 123456789, plt.figure(2),
                                 accumulate_reward, avg_accumulate_reward, STD_accumulate_reward,
                                 output_dir_path)
                 break
@@ -293,8 +261,8 @@ def Main():
         # Loss function of bellman eq to priority assessment
         loss_eq = np.abs(target_value.data - current_Q_value.squeeze().data)
 
-        transition = Transition(state=state, action=action, next_state=next_state,
-                                reward=reward, done=float(done))
+        transition = Transition(state=state.cpu(), action=action.cpu(), next_state=next_state.cpu(),
+                                reward=reward.cpu(), done=float(done))
 
         memory.push(transition, loss_eq)
 
@@ -341,9 +309,8 @@ def Main():
             # training details
             if i_episode % 20 == 0:
                 plot_durations(accumulate_reward, avg_accumulate_reward, STD_accumulate_reward)
-                print('Episode {}\tAvg. Reward: {:.2f}\tEpsilon: {:.4f}\t'.format(
+                print('Episode {}\tAverage Reward: {:.2f}\tEpsilon: {:.4f}\t'.format(
                     i_episode, avg_accumulate_reward[-1], eps_threshold))
-                print('Best avg. episodic reward:', best_avg_score)
 
     env.render()
     env.close()
