@@ -253,6 +253,7 @@ def EncodedPram(encode_method):
     dest_encoded_size = 4
     taxirow_encoded_size = 5
     taxicol_encoded_size = 5
+    pass_encoded_size = 0
     if encode_method is 'one_hot':
         in_channels = 500
     elif encode_method is '16_hot':
