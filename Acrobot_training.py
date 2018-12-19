@@ -238,7 +238,7 @@ def Main():
         # stop criterion average reward above under 200
         if len(avg_accumulate_reward):
             if avg_accumulate_reward[-1] > Cons.STOP_CONDITION:
-                policy_net.Save(optimizer, 123456789, plt.figure(2),
+                policy_net.Save(optimizer, 'Model_Wieghts', plt.figure(2),
                                 accumulate_reward, avg_accumulate_reward, STD_accumulate_reward,
                                 output_dir_path)
                 break
