@@ -13,7 +13,7 @@ $ git clone https://github.com/LiorAl/Deep_RL_EX1
 
 For load and run the trained agent use:  
 ```
-DQN_eval.py  
+$ python DQN_eval.py  
 ```
 
 ## Taxi AC section ##
@@ -23,7 +23,7 @@ DQN_eval.py
 
 For load and run the trained agent use:  
 ```
-AC_eval.py 
+$ python AC_eval.py 
 ```
 
 ## Acrobot section ##
@@ -35,5 +35,5 @@ AC_eval.py
 
 For load and run the trained agent use:  
 ```
-python Acrobot_Demo.py  
+$ python Acrobot_Demo.py  
 ```
