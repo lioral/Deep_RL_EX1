@@ -6,6 +6,9 @@ clone all files with:
 $ git clone https://github.com/LiorAl/Deep_RL_EX1
 ```
 
+**DRL_Report.pfg** -> Exercise report documente   
+
+
 ## Taxi DQN section ##
 **DQN_train.py** -> training script for the taxi agent.   
 **DQN_eval.py** -> Load trained Taxi agent and evaluate performance over 1000 episodes.   
